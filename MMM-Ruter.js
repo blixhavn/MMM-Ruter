@@ -27,7 +27,7 @@ Module.register("MMM-Ruter",{
 	},
 
 	getScripts: function() {
-		return ["moment.js"];
+		return ["moment.js", "graphql.js"];
 	},
 
 	getTranslations: function() {
@@ -108,31 +108,15 @@ Module.register("MMM-Ruter",{
 	startPolling: function() {
 		var self = this;
 
-		var promises = [];
-		for(var i=0; i < this.config.stops.length; i++) {
-			promises.push(new Promise((resolv) => {
-				this.getStopInfo(this.config.stops[i], function(err, result) {
-					resolv(result);
-				});
-			}));
-		}
-		
-		Promise.all(promises).then(function(promiseResults) {
-			if (promiseResults.length > 0) {
-				var allJourneys = [];
-				for(var i=0; i < promiseResults.length; i++) {
-					allJourneys = allJourneys.concat(promiseResults[i])
-				}
-				
-				allJourneys.sort(function(a,b) {
-					var dateA = new Date(a.time);
-					var dateB = new Date(b.time);
-					return dateA - dateB;
-				});
+		this.getJourneys(this.config.stops, function(err, result) {
+			result.sort(function(a,b) {
+				var dateA = new Date(a.time);
+				var dateB = new Date(b.time);
+				return dateA - dateB;
+			});
 
-				self.journeys = allJourneys.slice(0, self.config.maxItems);
-			}
-		});
+			self.journeys = result;
+		})
 	},
 	
 	updateDomIfNeeded: function() {
@@ -153,19 +137,50 @@ Module.register("MMM-Ruter",{
 		}
 	},
 
-	getStopInfo: function(stopItem, callback) {
+	getJourneys: function(stopItems, callback) {
 		var self = this;
 
+		var stopPlaces = '["' + stopItems.map((stop) => `NSR:StopPlace:${stop.stopId}`).join('", "') + '"]';
+
+		var url = "https://api.entur.io/journey-planner/v2/graphql";
+		var query = {query: `
+		fragment estimatedCallsParts on EstimatedCall {
+			realtime
+			destinationDisplay {
+			  frontText
+			}
+			quay {
+			  publicCode
+			}
+			expectedDepartureTime
+			actualDepartureTime
+			aimedDepartureTime
+			serviceJourney {
+			  line {
+				publicCode
+				transportMode
+			  }        
+			}
+		} query {stopPlaces(ids: ${stopPlaces}) {
+			estimatedCalls(whiteListedModes: [rail,bus,metro,tram,water], numberOfDepartures: ${self.config.maxItems}, omitNonBoarding: true, timeRange: 14400) {
+				...estimatedCallsParts
+			}, name
+			}
+			}
+		`};
+
 		var HttpClient = function() {
-			this.get = function(requestUrl, requestCallback) {
+			this.post = function(requestUrl, body, requestCallback) {
 				var httpRequest = new XMLHttpRequest();
-				httpRequest.onreadystatechange = function() { 
-					if (httpRequest.readyState == 4 && httpRequest.status == 200)
+				httpRequest.onreadystatechange = function() {
+					if (httpRequest.readyState == 4 && httpRequest.status == 200) {
 						requestCallback(httpRequest.responseText);
+					}
 				}
 
-				httpRequest.open( "GET", requestUrl, true );            
-				httpRequest.send( null );
+				httpRequest.open("POST", requestUrl, true)
+				httpRequest.setRequestHeader("Content-Type", "application/json")
+				httpRequest.send(JSON.stringify(body))
 			}
 		}
 
@@ -177,63 +192,44 @@ Module.register("MMM-Ruter",{
 			
 			return false;
 		};
-
-		var departureUrl = function() {
-			var dateParam = ""
-			if (stopItem.timeToThere) {
-				var min = stopItem.timeToThere;
-				var timeAhead = moment(moment.now()).add(min, "minute").format().substring(0, 16);
-				console.log("Looking for journeys " + min + " minutes ahead in time.");
-				dateParam = "?datetime=" + timeAhead;
-			} else {
-				console.log("Looking for current journeys");
-			}
-			
-			return "http://reisapi.ruter.no/StopVisit/GetDepartures/" + stopItem.stopId + dateParam;
-		};
-
-		var stopUrl = function() {
-			return "http://reisapi.ruter.no/Place/GetStop/" + stopItem.stopId;
-		};
-
+		
 		var client = new HttpClient();
 
-		client.get(stopUrl(), function(stopResponse) {
-			var stop = JSON.parse(stopResponse);
+		client.post(url, query, function(stopsResponse) {
+			console.log("Response received");
 
-			client.get(departureUrl(), function(response) {
-				var stops = JSON.parse(response);
-	
-				var allStopItems = new Array();
-	
-				for(var j = 0; j < stops.length; j++) {
-					var journey = stops[j].MonitoredVehicleJourney;
-					
-					if (shouldAddPlatform(journey.MonitoredCall.DeparturePlatformName, stopItem.platforms)) {
-						var numBlockParts = null;
-						if (journey.TrainBlockPart != null) {
-							numBlockParts = journey.TrainBlockPart.NumberOfBlockParts;
-						}
+			var stopsObject = JSON.parse(stopsResponse);
+			var stops = stopsObject.data.stopPlaces;
 
-						var stopName = stopItem.stopName ? stopItem.stopName : stop.Name;
-						if (self.config.maxNameLength) {
-							stopName = stopName.substring(0, self.config.maxNameLength);
-						}
+			allStopItems = new Array();
 
+			for(var j = 0; j < stops.length; j++) {
+				console.log("Iterating stops");
+				journeys = stops[j].estimatedCalls;
+
+				var stopName = stopItems[j].stopName ? stopItems[j].stopName : stops[j].name;
+				/*if (self.config.maxNameLength) {
+					stopName = stopName.substring(0, self.config.maxNameLength);
+				}*/
+
+				console.log("Iterating journeys");
+				for (var k = 0; k < journeys.length; k++) {
+					if (shouldAddPlatform(journeys[k].quay.publicCode, stopItems[j].platforms)) {
+						console.log("Adding journey");
 						allStopItems.push({
-							stopId: stopItem.stopId,
+							stopId: stopItems[j].stopId,
 							stopName: stopName,
-							lineName: journey.PublishedLineName,
-							destinationName: journey.DestinationName,
-							time: journey.MonitoredCall.ExpectedDepartureTime,
-							platform: journey.MonitoredCall.DeparturePlatformName
+							lineName: journeys[k].serviceJourney.line.publicCode,
+							transportMode: journeys[k].serviceJourney.line.transportMode,
+							destinationName: journeys[k].destinationDisplay.frontText,
+							time: journeys[k].expectedDepartureTime,
+							platform: journeys[k].quay.publicCode
 						});
 					}
-				};
-	
-				callback(null, allStopItems)		
-			});
-		})
+				}
+			}
+			callback(null, allStopItems);
+		});
 	},
 	
 	getTableHeaderRow: function() {
